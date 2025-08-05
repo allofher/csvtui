@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"encoding/csv"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
@@ -21,6 +23,7 @@ import (
 type model struct {
 	csvData      [][]string
 	filename     string
+	delimiter    rune
 	originalData [][]string
 	savePrompt   bool
 	hasChanges   bool
@@ -77,7 +80,95 @@ type model struct {
 	dimColors  map[DataType]lipgloss.Color
 }
 
-func readCSV(filename string) ([][]string, error) {
+func parseDelimiterFlag(delimiterFlag string) (rune, error) {
+	switch strings.ToLower(delimiterFlag) {
+	case "comma", ",":
+		return ',', nil
+	case "semicolon", ";":
+		return ';', nil
+	case "tab", "\\t":
+		return '\t', nil
+	case "pipe", "|":
+		return '|', nil
+	default:
+		// Try to parse as a single character
+		if len(delimiterFlag) == 1 {
+			return rune(delimiterFlag[0]), nil
+		}
+		return ',', fmt.Errorf("invalid delimiter '%s'. Use comma, semicolon, tab, pipe, or any single character", delimiterFlag)
+	}
+}
+
+func detectDelimiter(filename string) (rune, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return ',', fmt.Errorf("error opening file %s: %v", filename, err)
+	}
+	defer file.Close()
+
+	// Common delimiters to test
+	delimiters := []rune{',', ';', '\t', '|'}
+	scanner := bufio.NewScanner(file)
+
+	// Read up to 25 lines for analysis
+	var lines []string
+	lineCount := 0
+	for scanner.Scan() && lineCount < 25 {
+		lines = append(lines, scanner.Text())
+		lineCount++
+	}
+
+	if err := scanner.Err(); err != nil {
+		return ',', fmt.Errorf("error reading file for delimiter detection: %v", err)
+	}
+
+	if len(lines) == 0 {
+		return ',', fmt.Errorf("file is empty")
+	}
+
+	bestDelimiter := ','
+	maxConsistency := 0
+
+	// Test each delimiter
+	for _, delimiter := range delimiters {
+		consistency := 0
+		var fieldCounts []int
+
+		// Parse each line with this delimiter
+		for _, line := range lines {
+			reader := csv.NewReader(strings.NewReader(line))
+			reader.Comma = delimiter
+			reader.FieldsPerRecord = -1 // Allow variable number of fields
+
+			record, err := reader.Read()
+			if err != nil {
+				continue // Skip lines that can't be parsed with this delimiter
+			}
+
+			fieldCounts = append(fieldCounts, len(record))
+		}
+
+		// Calculate consistency (how many lines have the same field count as the first line)
+		if len(fieldCounts) > 0 {
+			expectedFields := fieldCounts[0]
+			for _, count := range fieldCounts {
+				if count == expectedFields && expectedFields > 1 {
+					consistency++
+				}
+			}
+		}
+
+		// Prefer delimiter with highest consistency
+		if consistency > maxConsistency {
+			maxConsistency = consistency
+			bestDelimiter = delimiter
+		}
+	}
+
+	return bestDelimiter, nil
+}
+
+func readCSV(filename string, delimiter rune) ([][]string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, fmt.Errorf("error opening file %s: %v", filename, err)
@@ -85,9 +176,10 @@ func readCSV(filename string) ([][]string, error) {
 	defer file.Close()
 
 	reader := csv.NewReader(file)
+	reader.Comma = delimiter
 	records, err := reader.ReadAll()
 	if err != nil {
-		return nil, fmt.Errorf("error reading CSV file: %v", err)
+		return nil, fmt.Errorf("error reading CSV file with delimiter '%c': %v", delimiter, err)
 	}
 
 	if len(records) == 0 {
@@ -97,7 +189,7 @@ func readCSV(filename string) ([][]string, error) {
 	return records, nil
 }
 
-func writeCSV(filename string, data [][]string) error {
+func writeCSV(filename string, data [][]string, delimiter rune) error {
 	file, err := os.Create(filename)
 	if err != nil {
 		return fmt.Errorf("error creating file %s: %v", filename, err)
@@ -105,6 +197,7 @@ func writeCSV(filename string, data [][]string) error {
 	defer file.Close()
 
 	writer := csv.NewWriter(file)
+	writer.Comma = delimiter
 	defer writer.Flush()
 
 	for _, record := range data {
@@ -118,11 +211,11 @@ func writeCSV(filename string, data [][]string) error {
 
 func (m *model) writeBackup() error {
 	backupFilename := m.filename + ".temp"
-	return writeCSV(backupFilename, m.csvData)
+	return writeCSV(backupFilename, m.csvData, m.delimiter)
 }
 
 func (m *model) saveToOriginal() error {
-	if err := writeCSV(m.filename, m.csvData); err != nil {
+	if err := writeCSV(m.filename, m.csvData, m.delimiter); err != nil {
 		return err
 	}
 
@@ -688,7 +781,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					filteredData = append(filteredData, m.activeHeaders)
 					filteredData = append(filteredData, m.activeRows...)
 
-					if err := writeCSV(filename, filteredData); err != nil {
+					if err := writeCSV(filename, filteredData, m.delimiter); err != nil {
 						// Could show error, but for now just quit anyway
 					}
 				}
@@ -1750,9 +1843,48 @@ func (m *model) resetFilters() {
 	m.viewportY = 0
 }
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <csv-file>\n", os.Args[0])
+	// Define command-line flags
+	var delimiterFlag = flag.String("delimiter", "", "CSV delimiter character (comma, semicolon, tab, pipe, or any single character). If not specified, auto-detection will be used.")
+	flag.StringVar(delimiterFlag, "d", "", "CSV delimiter character (shorthand)")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] <csv-file>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nOptions:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s data.csv                    # Auto-detect delimiter\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -delimiter=semicolon data.csv  # Use semicolon delimiter\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -d semicolon data.csv          # Use semicolon delimiter (shorthand)\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -delimiter=tab data.csv        # Use tab delimiter\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -d '|' data.csv                # Use pipe delimiter (shorthand)\n", os.Args[0])
+	}
+	flag.Parse()
+
+	if flag.NArg() < 1 {
+		flag.Usage()
 		os.Exit(1)
+	}
+
+	filename := flag.Arg(0)
+
+	// Determine delimiter
+	var delimiter rune
+	var err error
+
+	if *delimiterFlag == "" {
+		// Auto-detect delimiter
+		delimiter, err = detectDelimiter(filename)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error detecting delimiter: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Falling back to comma delimiter\n")
+			delimiter = ','
+		}
+	} else {
+		// Parse user-specified delimiter
+		delimiter, err = parseDelimiterFlag(*delimiterFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing delimiter flag: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// Load config
@@ -1771,8 +1903,7 @@ func main() {
 	hotkeys := applyConfigHotkeys(config, defaultHotkeys)
 	keyMap := createKeyMapFromConfig(hotkeys)
 
-	filename := os.Args[1]
-	records, err := readCSV(filename)
+	records, err := readCSV(filename, delimiter)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
@@ -1792,6 +1923,7 @@ func main() {
 	m := model{
 		csvData:      records,
 		filename:     filename,
+		delimiter:    delimiter,
 		originalData: originalData,
 		savePrompt:   false,
 		hasChanges:   false,
